@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useReducer, useRef, useState } from 'react'
+import { DragEvent, FormEvent, PointerEvent, useEffect, useMemo, useReducer, useRef, useState } from 'react'
 
 type Item = {
   id: string
@@ -11,7 +11,6 @@ type Item = {
 type PackListState = {
   version: 1
   listTitle: string
-  listSubtitle: string
   items: Item[]
   updatedAt: number
 }
@@ -20,10 +19,9 @@ type Action =
   | { type: 'TOGGLE_ITEM'; id: string }
   | { type: 'ADD_ITEM'; payload: { label: string; icon: string } }
   | { type: 'DELETE_ITEM'; id: string }
-  | { type: 'MOVE_ITEM'; id: string; direction: -1 | 1 }
   | { type: 'RESET_DONE' }
   | { type: 'LOAD_STATE'; payload: PackListState }
-  | { type: 'UPDATE_META'; payload: { listTitle: string; listSubtitle: string } }
+  | { type: 'UPDATE_META'; payload: { listTitle: string } }
 
 const STORAGE_KEY = 'packlist:v1'
 
@@ -56,7 +54,6 @@ const normalizeOrders = (items: Item[]) => sortByOrder(items).map((item, index) 
 const createInitialState = (): PackListState => ({
   version: 1,
   listTitle: '旅行のもちもの',
-  listSubtitle: '出発前にこれだけ',
   items: TRAVEL_TEMPLATE.map((entry, index) => ({
     id: createId(),
     icon: entry.icon,
@@ -72,7 +69,6 @@ const isValidState = (value: unknown): value is PackListState => {
   const candidate = value as Partial<PackListState>
   if (candidate.version !== 1) return false
   if (typeof candidate.listTitle !== 'string') return false
-  if (typeof candidate.listSubtitle !== 'string') return false
   if (typeof candidate.updatedAt !== 'number') return false
   if (!Array.isArray(candidate.items)) return false
 
@@ -135,24 +131,6 @@ const reducer = (state: PackListState, action: Action): PackListState => {
         items: normalizeOrders(state.items.filter((item) => item.id !== action.id)),
         updatedAt: now()
       }
-    case 'MOVE_ITEM': {
-      const sorted = sortByOrder(state.items)
-      const currentIndex = sorted.findIndex((item) => item.id === action.id)
-      const targetIndex = currentIndex + action.direction
-      if (currentIndex < 0 || targetIndex < 0 || targetIndex >= sorted.length) {
-        return state
-      }
-
-      const next = [...sorted]
-      const [moved] = next.splice(currentIndex, 1)
-      next.splice(targetIndex, 0, moved)
-
-      return {
-        ...state,
-        items: normalizeOrders(next),
-        updatedAt: now()
-      }
-    }
     case 'RESET_DONE':
       return {
         ...state,
@@ -165,7 +143,6 @@ const reducer = (state: PackListState, action: Action): PackListState => {
       return {
         ...state,
         listTitle: action.payload.listTitle,
-        listSubtitle: action.payload.listSubtitle,
         updatedAt: now()
       }
     default:
@@ -181,8 +158,24 @@ function App() {
   const [error, setError] = useState('')
   const [toast, setToast] = useState('')
   const [showReady, setShowReady] = useState(false)
-  const [listTitleInput, setListTitleInput] = useState(state.listTitle)
-  const [listSubtitleInput, setListSubtitleInput] = useState(state.listSubtitle)
+  const [draggingId, setDraggingId] = useState<string | null>(null)
+  const [isTrashOver, setIsTrashOver] = useState(false)
+
+  const trashZoneRef = useRef<HTMLButtonElement | null>(null)
+  const pointerDragRef = useRef<{
+    pointerId: number | null
+    id: string | null
+    startX: number
+    startY: number
+    dragging: boolean
+  }>({
+    pointerId: null,
+    id: null,
+    startX: 0,
+    startY: 0,
+    dragging: false
+  })
+  const suppressNextClickRef = useRef(false)
 
   const sortedItems = useMemo(() => sortByOrder(state.items), [state.items])
   const todoItems = sortedItems.filter((item) => !item.done)
@@ -214,8 +207,6 @@ function App() {
   const showToast = (message: string) => setToast(message)
 
   const openEditor = () => {
-    setListTitleInput(state.listTitle)
-    setListSubtitleInput(state.listSubtitle)
     setNewIcon('')
     setNewLabel('')
     setError('')
@@ -243,17 +234,6 @@ function App() {
     setError('')
   }
 
-  const saveMeta = () => {
-    dispatch({
-      type: 'UPDATE_META',
-      payload: {
-        listTitle: listTitleInput.trim() || '旅行のもちもの',
-        listSubtitle: listSubtitleInput.trim() || '出発前にこれだけ'
-      }
-    })
-    showToast('編集を保存しました')
-  }
-
   const resetDone = () => {
     const ok = window.confirm('完了状態をリセットしますか？')
     if (!ok) return
@@ -271,141 +251,257 @@ function App() {
     }
   }
 
+  const editTitle = () => {
+    const input = window.prompt('タイトルを編集してください', state.listTitle)
+    if (input === null) return
+    const nextTitle = input.trim() || '旅行のもちもの'
+    dispatch({
+      type: 'UPDATE_META',
+      payload: { listTitle: nextTitle }
+    })
+  }
+
+  const resetDragState = () => {
+    setDraggingId(null)
+    setIsTrashOver(false)
+    pointerDragRef.current = {
+      pointerId: null,
+      id: null,
+      startX: 0,
+      startY: 0,
+      dragging: false
+    }
+  }
+
+  const isPointInTrash = (clientX: number, clientY: number) => {
+    const rect = trashZoneRef.current?.getBoundingClientRect()
+    if (!rect) return false
+    return clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom
+  }
+
+  const deleteItemById = (id: string) => {
+    dispatch({ type: 'DELETE_ITEM', id })
+    showToast('アイテムを削除しました')
+  }
+
+  const handleItemDragStart = (e: DragEvent<HTMLButtonElement>, id: string) => {
+    setDraggingId(id)
+    setIsTrashOver(false)
+    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer.setData('text/plain', id)
+  }
+
+  const handleItemDragEnd = () => {
+    resetDragState()
+  }
+
+  const handleTrashDragOver = (e: DragEvent<HTMLButtonElement>) => {
+    e.preventDefault()
+    if (draggingId) setIsTrashOver(true)
+    e.dataTransfer.dropEffect = 'move'
+  }
+
+  const handleTrashDragLeave = () => {
+    setIsTrashOver(false)
+  }
+
+  const handleTrashDrop = (e: DragEvent<HTMLButtonElement>) => {
+    e.preventDefault()
+    const id = draggingId || e.dataTransfer.getData('text/plain')
+    if (id) deleteItemById(id)
+    resetDragState()
+  }
+
+  const handleItemPointerDown = (e: PointerEvent<HTMLButtonElement>, id: string) => {
+    if (e.pointerType === 'mouse') return
+    pointerDragRef.current = {
+      pointerId: e.pointerId,
+      id,
+      startX: e.clientX,
+      startY: e.clientY,
+      dragging: false
+    }
+    e.currentTarget.setPointerCapture(e.pointerId)
+  }
+
+  const handleItemPointerMove = (e: PointerEvent<HTMLButtonElement>, id: string) => {
+    const current = pointerDragRef.current
+    if (current.pointerId !== e.pointerId || current.id !== id) return
+
+    const distance = Math.hypot(e.clientX - current.startX, e.clientY - current.startY)
+    if (!current.dragging && distance > 10) {
+      current.dragging = true
+      suppressNextClickRef.current = true
+      setDraggingId(id)
+    }
+
+    if (!current.dragging) return
+    setIsTrashOver(isPointInTrash(e.clientX, e.clientY))
+  }
+
+  const finishTouchDrag = (e: PointerEvent<HTMLButtonElement>, id: string, allowDelete: boolean) => {
+    const current = pointerDragRef.current
+    if (current.pointerId !== e.pointerId || current.id !== id) return
+
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId)
+    }
+
+    if (allowDelete && current.dragging && current.id && isPointInTrash(e.clientX, e.clientY)) {
+      deleteItemById(current.id)
+    }
+
+    if (current.dragging) {
+      suppressNextClickRef.current = true
+      window.setTimeout(() => {
+        suppressNextClickRef.current = false
+      }, 0)
+    }
+
+    resetDragState()
+  }
+
+  const handleItemPointerUp = (e: PointerEvent<HTMLButtonElement>, id: string) => {
+    finishTouchDrag(e, id, true)
+  }
+
+  const handleItemPointerCancel = (e: PointerEvent<HTMLButtonElement>, id: string) => {
+    finishTouchDrag(e, id, false)
+  }
+
+  const handleItemClick = (id: string) => {
+    if (suppressNextClickRef.current) {
+      suppressNextClickRef.current = false
+      return
+    }
+    dispatch({ type: 'TOGGLE_ITEM', id })
+  }
+
   return (
     <main className="app">
       <header className="header">
-        <h1>{state.listTitle}</h1>
-        <p>{state.listSubtitle}</p>
+        <div className="title-row">
+          <h1>{state.listTitle}</h1>
+          <button type="button" className="title-edit-button" onClick={editTitle} aria-label="タイトルを編集">
+            ✏️
+          </button>
+        </div>
       </header>
 
       {showReady && <div className="ready-banner">準備OK</div>}
 
       <section className="section">
         <h2>まだ</h2>
-        <div className="list">
+        <ul className="list">
           {todoItems.map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              className="item-card"
-              onClick={() => dispatch({ type: 'TOGGLE_ITEM', id: item.id })}
-            >
-              <span className="item-icon">{item.icon}</span>
-              <span className="item-label">{item.label}</span>
-            </button>
+            <li key={item.id} className="list-item">
+              <button
+                type="button"
+                className="item-card"
+                draggable
+                onDragStart={(e) => handleItemDragStart(e, item.id)}
+                onDragEnd={handleItemDragEnd}
+                onPointerDown={(e) => handleItemPointerDown(e, item.id)}
+                onPointerMove={(e) => handleItemPointerMove(e, item.id)}
+                onPointerUp={(e) => handleItemPointerUp(e, item.id)}
+                onPointerCancel={(e) => handleItemPointerCancel(e, item.id)}
+                onClick={() => handleItemClick(item.id)}
+              >
+                <span className="item-icon">{item.icon}</span>
+                <span className="item-label">{item.label}</span>
+              </button>
+            </li>
           ))}
-          {todoItems.length === 0 && <p className="empty">未完了のアイテムはありません</p>}
-        </div>
+          {todoItems.length === 0 && (
+            <li className="empty" aria-live="polite">
+              未完了のアイテムはありません
+            </li>
+          )}
+        </ul>
       </section>
 
       <section className="section">
         <h2>できた</h2>
-        <div className="list">
+        <ul className="list">
           {doneItems.map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              className="item-card done"
-              onClick={() => dispatch({ type: 'TOGGLE_ITEM', id: item.id })}
-            >
-              <span className="item-icon">{item.icon}</span>
-              <span className="item-label">{item.label}</span>
-            </button>
+            <li key={item.id} className="list-item">
+              <button
+                type="button"
+                className="item-card done"
+                draggable
+                onDragStart={(e) => handleItemDragStart(e, item.id)}
+                onDragEnd={handleItemDragEnd}
+                onPointerDown={(e) => handleItemPointerDown(e, item.id)}
+                onPointerMove={(e) => handleItemPointerMove(e, item.id)}
+                onPointerUp={(e) => handleItemPointerUp(e, item.id)}
+                onPointerCancel={(e) => handleItemPointerCancel(e, item.id)}
+                onClick={() => handleItemClick(item.id)}
+              >
+                <span className="item-icon">{item.icon}</span>
+                <span className="item-label">{item.label}</span>
+              </button>
+            </li>
           ))}
-          {doneItems.length === 0 && <p className="empty">完了したアイテムはありません</p>}
-        </div>
+          {doneItems.length === 0 && (
+            <li className="empty" aria-live="polite">
+              完了したアイテムはありません
+            </li>
+          )}
+        </ul>
       </section>
 
       <footer className="footer">
-        <button type="button" onClick={resetDone}>
-          リセット
+        <button type="button" className="icon-button" onClick={openEditor} aria-label="アイテムを追加">
+          ＋
         </button>
-        <button type="button" onClick={openEditor}>
-          編集
+        <button
+          type="button"
+          ref={trashZoneRef}
+          className={`icon-button trash-button${isTrashOver ? ' active' : ''}`}
+          aria-label="ゴミ箱"
+          onDragOver={handleTrashDragOver}
+          onDragLeave={handleTrashDragLeave}
+          onDrop={handleTrashDrop}
+        >
+          🗑️
         </button>
-        <button type="button" onClick={copyLink}>
-          リンクをコピー
+        <button type="button" className="icon-button" onClick={resetDone} aria-label="リセット">
+          ↺
+        </button>
+        <button type="button" className="icon-button" onClick={copyLink} aria-label="リンクをコピー">
+          🔗
         </button>
       </footer>
 
       {isEditOpen && (
         <div className="modal-overlay" role="presentation" onClick={() => setIsEditOpen(false)}>
           <section className="modal" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
-            <h3>編集</h3>
-
-            <div className="meta-edit">
-              <label>
-                タイトル
-                <input
-                  value={listTitleInput}
-                  maxLength={30}
-                  onChange={(e) => setListTitleInput(e.target.value)}
-                />
-              </label>
-              <label>
-                サブタイトル
-                <input
-                  value={listSubtitleInput}
-                  maxLength={40}
-                  onChange={(e) => setListSubtitleInput(e.target.value)}
-                />
-              </label>
-              <button type="button" onClick={saveMeta}>
-                タイトルを保存
-              </button>
-            </div>
+            <h3>アイテムを追加</h3>
 
             <form className="add-form" onSubmit={addItem}>
-              <label>
-                アイコン
-                <input
-                  placeholder="未入力で📦"
-                  maxLength={2}
-                  value={newIcon}
-                  onChange={(e) => setNewIcon(e.target.value)}
-                />
-              </label>
-              <label>
-                アイテム名
-                <input
-                  placeholder="1〜20文字"
-                  maxLength={20}
-                  value={newLabel}
-                  onChange={(e) => setNewLabel(e.target.value)}
-                />
-              </label>
+              <div className="add-row">
+                <label>
+                  アイコン
+                  <input
+                    placeholder="未入力で📦"
+                    maxLength={2}
+                    value={newIcon}
+                    onChange={(e) => setNewIcon(e.target.value)}
+                  />
+                </label>
+                <label>
+                  アイテム名
+                  <input
+                    placeholder="1〜20文字"
+                    maxLength={20}
+                    value={newLabel}
+                    onChange={(e) => setNewLabel(e.target.value)}
+                  />
+                </label>
+              </div>
               <button type="submit">追加</button>
               {error && <p className="error">{error}</p>}
             </form>
-
-            <div className="edit-list">
-              {sortedItems.map((item, index) => (
-                <div key={item.id} className="edit-row">
-                  <span>
-                    {item.icon} {item.label}
-                  </span>
-                  <div className="edit-actions">
-                    <button
-                      type="button"
-                      disabled={index === 0}
-                      onClick={() => dispatch({ type: 'MOVE_ITEM', id: item.id, direction: -1 })}
-                    >
-                      ↑
-                    </button>
-                    <button
-                      type="button"
-                      disabled={index === sortedItems.length - 1}
-                      onClick={() => dispatch({ type: 'MOVE_ITEM', id: item.id, direction: 1 })}
-                    >
-                      ↓
-                    </button>
-                    <button type="button" onClick={() => dispatch({ type: 'DELETE_ITEM', id: item.id })}>
-                      削除
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
 
             <button type="button" className="close-button" onClick={() => setIsEditOpen(false)}>
               閉じる
