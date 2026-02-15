@@ -1,4 +1,4 @@
-import { DragEvent, FormEvent, PointerEvent, useEffect, useMemo, useReducer, useRef, useState } from 'react'
+import { ChangeEvent, DragEvent, FormEvent, PointerEvent, useEffect, useMemo, useReducer, useRef, useState } from 'react'
 
 type Item = {
   id: string
@@ -40,6 +40,8 @@ type StoredState = {
   selectedTemplateId?: string | null
 }
 
+type ItemNotesById = Record<string, string>
+
 type Action =
   | { type: 'TOGGLE_ITEM'; id: string }
   | { type: 'ADD_ITEM'; payload: { label: string; icon: string } }
@@ -49,6 +51,10 @@ type Action =
   | { type: 'APPLY_TEMPLATE'; template: Template | null }
 
 const STORAGE_KEY = 'packlist:v1'
+const ITEM_NOTES_STORAGE_KEY = 'packlist:item-notes:v1'
+const PHOTO_DB_NAME = 'packlist-media-v1'
+const PHOTO_STORE_NAME = 'item-photos'
+const LONG_PRESS_MS = 450
 const DEFAULT_LIST_TITLE = '持ち物チェックリスト'
 const ICON_OPTIONS = [
   '📦',
@@ -400,6 +406,102 @@ const loadStateSafely = (): PackListState | null => {
   }
 }
 
+const loadItemNotesSafely = (): ItemNotesById => {
+  try {
+    if (typeof window === 'undefined') return {}
+    const raw = window.localStorage.getItem(ITEM_NOTES_STORAGE_KEY)
+    if (!raw) return {}
+
+    const parsed = JSON.parse(raw) as unknown
+    if (!parsed || typeof parsed !== 'object') return {}
+
+    const entries = Object.entries(parsed as Record<string, unknown>).filter(
+      ([id, value]) => typeof id === 'string' && typeof value === 'string'
+    )
+    return Object.fromEntries(entries)
+  } catch {
+    return {}
+  }
+}
+
+type ItemPhotoRecord = {
+  itemId: string
+  blob: Blob
+  updatedAt: number
+}
+
+const openPhotoDatabase = (): Promise<IDBDatabase> =>
+  new Promise((resolve, reject) => {
+    if (typeof window === 'undefined' || !('indexedDB' in window)) {
+      reject(new Error('IndexedDB is not available'))
+      return
+    }
+
+    const request = window.indexedDB.open(PHOTO_DB_NAME, 1)
+
+    request.onupgradeneeded = () => {
+      const db = request.result
+      if (!db.objectStoreNames.contains(PHOTO_STORE_NAME)) {
+        db.createObjectStore(PHOTO_STORE_NAME, { keyPath: 'itemId' })
+      }
+    }
+
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error ?? new Error('Failed to open IndexedDB'))
+  })
+
+const waitForTransaction = (tx: IDBTransaction): Promise<void> =>
+  new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve()
+    tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'))
+    tx.onerror = () => reject(tx.error ?? new Error('IndexedDB transaction failed'))
+  })
+
+const readItemPhotoBlob = async (itemId: string): Promise<Blob | null> => {
+  const db = await openPhotoDatabase()
+  try {
+    const tx = db.transaction(PHOTO_STORE_NAME, 'readonly')
+    const store = tx.objectStore(PHOTO_STORE_NAME)
+    const request = store.get(itemId) as IDBRequest<ItemPhotoRecord | undefined>
+
+    const record = await new Promise<ItemPhotoRecord | undefined>((resolve, reject) => {
+      request.onsuccess = () => resolve(request.result)
+      request.onerror = () => reject(request.error ?? new Error('Failed to load photo'))
+    })
+
+    await waitForTransaction(tx)
+    return record?.blob ?? null
+  } finally {
+    db.close()
+  }
+}
+
+const saveItemPhotoBlob = async (itemId: string, blob: Blob): Promise<void> => {
+  const db = await openPhotoDatabase()
+  try {
+    const tx = db.transaction(PHOTO_STORE_NAME, 'readwrite')
+    tx.objectStore(PHOTO_STORE_NAME).put({
+      itemId,
+      blob,
+      updatedAt: now()
+    } as ItemPhotoRecord)
+    await waitForTransaction(tx)
+  } finally {
+    db.close()
+  }
+}
+
+const deleteItemPhotoBlob = async (itemId: string): Promise<void> => {
+  const db = await openPhotoDatabase()
+  try {
+    const tx = db.transaction(PHOTO_STORE_NAME, 'readwrite')
+    tx.objectStore(PHOTO_STORE_NAME).delete(itemId)
+    await waitForTransaction(tx)
+  } finally {
+    db.close()
+  }
+}
+
 const reducer = (state: PackListState, action: Action): PackListState => {
   switch (action.type) {
     case 'TOGGLE_ITEM':
@@ -494,12 +596,22 @@ function App() {
   const [toast, setToast] = useState('')
   const [showReady, setShowReady] = useState(false)
   const [openedFromChecklist, setOpenedFromChecklist] = useState(false)
+  const [itemNotes, setItemNotes] = useState<ItemNotesById>(loadItemNotesSafely)
+  const [detailItemId, setDetailItemId] = useState<string | null>(null)
+  const [detailNote, setDetailNote] = useState('')
+  const [detailPhotoUrl, setDetailPhotoUrl] = useState('')
+  const [detailPhotoError, setDetailPhotoError] = useState('')
+  const [isDetailPhotoLoading, setIsDetailPhotoLoading] = useState(false)
 
   const [draggingId, setDraggingId] = useState<string | null>(null)
   const [isTrashNear, setIsTrashNear] = useState(false)
   const [isTrashOver, setIsTrashOver] = useState(false)
 
   const trashZoneRef = useRef<HTMLButtonElement | null>(null)
+  const photoFileInputRef = useRef<HTMLInputElement | null>(null)
+  const detailPhotoObjectUrlRef = useRef<string | null>(null)
+  const detailPhotoLoadSeqRef = useRef(0)
+  const prevItemIdsRef = useRef<Set<string>>(new Set(initialData.state.items.map((item) => item.id)))
   const pointerDragRef = useRef<{
     pointerId: number | null
     id: string | null
@@ -514,12 +626,28 @@ function App() {
     dragging: false
   })
   const suppressNextClickRef = useRef(false)
+  const longPressRef = useRef<{
+    pointerId: number | null
+    itemId: string | null
+    startX: number
+    startY: number
+    timerId: number | null
+    triggered: boolean
+  }>({
+    pointerId: null,
+    itemId: null,
+    startX: 0,
+    startY: 0,
+    timerId: null,
+    triggered: false
+  })
 
   const sortedItems = useMemo(() => sortByOrder(state.items), [state.items])
   const todoItems = sortedItems.filter((item) => !item.done)
   const doneItems = sortedItems.filter((item) => item.done)
   const allDone = state.items.length > 0 && state.items.every((item) => item.done)
   const selectedIcon = newIcon.trim() || '📦'
+  const detailItem = useMemo(() => state.items.find((item) => item.id === detailItemId) ?? null, [state.items, detailItemId])
 
   const prevAllDone = useRef(allDone)
 
@@ -545,7 +673,116 @@ function App() {
     return () => window.clearTimeout(id)
   }, [toast])
 
+  useEffect(() => {
+    window.localStorage.setItem(ITEM_NOTES_STORAGE_KEY, JSON.stringify(itemNotes))
+  }, [itemNotes])
+
+  useEffect(() => {
+    const itemIds = new Set(state.items.map((item) => item.id))
+    setItemNotes((prev) => {
+      const next: ItemNotesById = {}
+      let changed = false
+
+      Object.entries(prev).forEach(([itemId, note]) => {
+        if (itemIds.has(itemId)) {
+          next[itemId] = note
+          return
+        }
+        changed = true
+      })
+
+      return changed ? next : prev
+    })
+  }, [state.items])
+
+  useEffect(() => {
+    const currentIds = new Set(state.items.map((item) => item.id))
+    const removedIds: string[] = []
+
+    prevItemIdsRef.current.forEach((itemId) => {
+      if (!currentIds.has(itemId)) removedIds.push(itemId)
+    })
+    prevItemIdsRef.current = currentIds
+
+    if (removedIds.length === 0) return
+
+    removedIds.forEach((itemId) => {
+      void deleteItemPhotoBlob(itemId).catch(() => undefined)
+    })
+  }, [state.items])
+
+  useEffect(() => {
+    if (!detailItemId) return
+    if (state.items.some((item) => item.id === detailItemId)) return
+    closeDetailEditor()
+  }, [state.items, detailItemId])
+
+  useEffect(() => {
+    return () => {
+      if (longPressRef.current.timerId !== null) {
+        window.clearTimeout(longPressRef.current.timerId)
+        longPressRef.current.timerId = null
+      }
+      if (detailPhotoObjectUrlRef.current) {
+        window.URL.revokeObjectURL(detailPhotoObjectUrlRef.current)
+        detailPhotoObjectUrlRef.current = null
+      }
+    }
+  }, [])
+
   const showToast = (message: string) => setToast(message)
+
+  const clearDetailPhotoPreview = () => {
+    if (detailPhotoObjectUrlRef.current) {
+      window.URL.revokeObjectURL(detailPhotoObjectUrlRef.current)
+      detailPhotoObjectUrlRef.current = null
+    }
+    setDetailPhotoUrl('')
+  }
+
+  const loadDetailPhoto = async (itemId: string) => {
+    const seq = detailPhotoLoadSeqRef.current + 1
+    detailPhotoLoadSeqRef.current = seq
+    setIsDetailPhotoLoading(true)
+    setDetailPhotoError('')
+
+    try {
+      const blob = await readItemPhotoBlob(itemId)
+      if (detailPhotoLoadSeqRef.current !== seq) return
+
+      clearDetailPhotoPreview()
+      if (!blob) return
+
+      const url = window.URL.createObjectURL(blob)
+      detailPhotoObjectUrlRef.current = url
+      setDetailPhotoUrl(url)
+    } catch {
+      if (detailPhotoLoadSeqRef.current !== seq) return
+      clearDetailPhotoPreview()
+      setDetailPhotoError('写真の読み込みに失敗しました')
+    } finally {
+      if (detailPhotoLoadSeqRef.current === seq) {
+        setIsDetailPhotoLoading(false)
+      }
+    }
+  }
+
+  const openDetailEditor = (itemId: string) => {
+    setDetailItemId(itemId)
+    setDetailNote(itemNotes[itemId] ?? '')
+    setDetailPhotoError('')
+    clearDetailPhotoPreview()
+    void loadDetailPhoto(itemId)
+  }
+
+  const closeDetailEditor = () => {
+    detailPhotoLoadSeqRef.current += 1
+    setDetailItemId(null)
+    setDetailNote('')
+    setIsDetailPhotoLoading(false)
+    setDetailPhotoError('')
+    clearDetailPhotoPreview()
+  }
 
   const closeEditor = () => {
     setIsEditOpen(false)
@@ -580,6 +817,60 @@ function App() {
     setNewIcon('')
     setError('')
     setIsIconPickerOpen(false)
+  }
+
+  const updateDetailNote = (value: string) => {
+    if (!detailItemId) return
+
+    setDetailNote(value)
+    setItemNotes((prev) => {
+      const next = { ...prev }
+      if (value.trim().length === 0) {
+        delete next[detailItemId]
+      } else {
+        next[detailItemId] = value
+      }
+      return next
+    })
+  }
+
+  const openPhotoPicker = () => {
+    photoFileInputRef.current?.click()
+  }
+
+  const handlePhotoFileChange = async (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    if (!file || !detailItemId) return
+
+    setDetailPhotoError('')
+    setIsDetailPhotoLoading(true)
+
+    try {
+      await saveItemPhotoBlob(detailItemId, file)
+      await loadDetailPhoto(detailItemId)
+      showToast('写真を保存しました')
+    } catch {
+      setIsDetailPhotoLoading(false)
+      setDetailPhotoError('写真の保存に失敗しました')
+    }
+  }
+
+  const deleteDetailPhoto = async () => {
+    if (!detailItemId) return
+
+    setDetailPhotoError('')
+    setIsDetailPhotoLoading(true)
+
+    try {
+      await deleteItemPhotoBlob(detailItemId)
+      clearDetailPhotoPreview()
+      setIsDetailPhotoLoading(false)
+      showToast('写真を削除しました')
+    } catch {
+      setIsDetailPhotoLoading(false)
+      setDetailPhotoError('写真の削除に失敗しました')
+    }
   }
 
   const resetDone = () => {
@@ -641,6 +932,64 @@ function App() {
     }
   }
 
+  const clearLongPressTimer = () => {
+    if (longPressRef.current.timerId !== null) {
+      window.clearTimeout(longPressRef.current.timerId)
+      longPressRef.current.timerId = null
+    }
+  }
+
+  const resetLongPressState = () => {
+    clearLongPressTimer()
+    longPressRef.current = {
+      pointerId: null,
+      itemId: null,
+      startX: 0,
+      startY: 0,
+      timerId: null,
+      triggered: false
+    }
+  }
+
+  const startLongPress = (e: PointerEvent<HTMLButtonElement>, itemId: string) => {
+    resetLongPressState()
+
+    longPressRef.current.pointerId = e.pointerId
+    longPressRef.current.itemId = itemId
+    longPressRef.current.startX = e.clientX
+    longPressRef.current.startY = e.clientY
+    longPressRef.current.triggered = false
+    longPressRef.current.timerId = window.setTimeout(() => {
+      if (longPressRef.current.pointerId !== e.pointerId) return
+      if (longPressRef.current.itemId !== itemId) return
+      if (longPressRef.current.triggered) return
+
+      longPressRef.current.triggered = true
+      suppressNextClickRef.current = true
+      openDetailEditor(itemId)
+      window.setTimeout(() => {
+        suppressNextClickRef.current = false
+      }, 500)
+    }, LONG_PRESS_MS)
+  }
+
+  const cancelLongPressOnMove = (e: PointerEvent<HTMLButtonElement>, itemId: string) => {
+    if (longPressRef.current.pointerId !== e.pointerId) return
+    if (longPressRef.current.itemId !== itemId) return
+    if (longPressRef.current.triggered) return
+
+    const distance = Math.hypot(e.clientX - longPressRef.current.startX, e.clientY - longPressRef.current.startY)
+    if (distance > 8) {
+      clearLongPressTimer()
+    }
+  }
+
+  const finishLongPress = (e: PointerEvent<HTMLButtonElement>, itemId: string) => {
+    if (longPressRef.current.pointerId !== e.pointerId) return
+    if (longPressRef.current.itemId !== itemId) return
+    resetLongPressState()
+  }
+
   const isPointInTrash = (clientX: number, clientY: number) => {
     const rect = trashZoneRef.current?.getBoundingClientRect()
     if (!rect) return false
@@ -658,10 +1007,21 @@ function App() {
 
   const deleteItemById = (id: string) => {
     dispatch({ type: 'DELETE_ITEM', id })
+    setItemNotes((prev) => {
+      if (!(id in prev)) return prev
+      const next = { ...prev }
+      delete next[id]
+      return next
+    })
+    if (detailItemId === id) {
+      closeDetailEditor()
+    }
+    void deleteItemPhotoBlob(id).catch(() => undefined)
     showToast('アイテムを削除しました')
   }
 
   const handleItemDragStart = (e: DragEvent<HTMLButtonElement>, id: string) => {
+    resetLongPressState()
     setDraggingId(id)
     setIsTrashNear(false)
     setIsTrashOver(false)
@@ -709,6 +1069,8 @@ function App() {
   }
 
   const handleItemPointerDown = (e: PointerEvent<HTMLButtonElement>, id: string) => {
+    startLongPress(e, id)
+
     if (e.pointerType === 'mouse') return
 
     pointerDragRef.current = {
@@ -723,6 +1085,9 @@ function App() {
   }
 
   const handleItemPointerMove = (e: PointerEvent<HTMLButtonElement>, id: string) => {
+    cancelLongPressOnMove(e, id)
+    if (e.pointerType === 'mouse') return
+
     const current = pointerDragRef.current
     if (current.pointerId !== e.pointerId || current.id !== id) return
 
@@ -764,10 +1129,14 @@ function App() {
   }
 
   const handleItemPointerUp = (e: PointerEvent<HTMLButtonElement>, id: string) => {
+    finishLongPress(e, id)
+    if (e.pointerType === 'mouse') return
     finishTouchDrag(e, id, true)
   }
 
   const handleItemPointerCancel = (e: PointerEvent<HTMLButtonElement>, id: string) => {
+    finishLongPress(e, id)
+    if (e.pointerType === 'mouse') return
     finishTouchDrag(e, id, false)
   }
 
@@ -847,6 +1216,7 @@ function App() {
                 onPointerMove={(e) => handleItemPointerMove(e, item.id)}
                 onPointerUp={(e) => handleItemPointerUp(e, item.id)}
                 onPointerCancel={(e) => handleItemPointerCancel(e, item.id)}
+                onContextMenu={(e) => e.preventDefault()}
                 onClick={() => handleItemClick(item.id)}
               >
                 <span className="item-icon">{item.icon}</span>
@@ -878,6 +1248,7 @@ function App() {
                 onPointerMove={(e) => handleItemPointerMove(e, item.id)}
                 onPointerUp={(e) => handleItemPointerUp(e, item.id)}
                 onPointerCancel={(e) => handleItemPointerCancel(e, item.id)}
+                onContextMenu={(e) => e.preventDefault()}
                 onClick={() => handleItemClick(item.id)}
               >
                 <span className="item-icon">{item.icon}</span>
@@ -915,6 +1286,60 @@ function App() {
           🔗
         </button>
       </footer>
+
+      {detailItem && (
+        <div className="modal-overlay" role="presentation" onClick={closeDetailEditor}>
+          <section className="modal detail-modal" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-top-row">
+              <h3>
+                {detailItem.icon} {detailItem.label}
+              </h3>
+              <button type="button" className="back-button" onClick={closeDetailEditor}>
+                戻る
+              </button>
+            </div>
+
+            <label className="detail-field">
+              <span className="detail-label">メモ</span>
+              <textarea
+                value={detailNote}
+                onChange={(e) => updateDetailNote(e.target.value)}
+                placeholder="メモを入力（任意）"
+                maxLength={500}
+              />
+            </label>
+
+            <div className="detail-actions">
+              <input
+                ref={photoFileInputRef}
+                type="file"
+                accept="image/*"
+                className="hidden-file-input"
+                onChange={handlePhotoFileChange}
+              />
+              <button type="button" className="detail-action-button" onClick={openPhotoPicker}>
+                写真を追加
+              </button>
+              {detailPhotoUrl && (
+                <button type="button" className="detail-action-button" onClick={deleteDetailPhoto}>
+                  写真を削除
+                </button>
+              )}
+            </div>
+
+            <div className="detail-photo-panel">
+              {isDetailPhotoLoading ? (
+                <p className="detail-status">写真を読み込み中...</p>
+              ) : detailPhotoUrl ? (
+                <img src={detailPhotoUrl} className="detail-photo-preview" alt={`${detailItem.label} の写真`} />
+              ) : (
+                <p className="detail-status">写真は未登録です</p>
+              )}
+              {detailPhotoError && <p className="error">{detailPhotoError}</p>}
+            </div>
+          </section>
+        </div>
+      )}
 
       {isEditOpen && (
         <div className="modal-overlay" role="presentation" onClick={closeEditor}>
