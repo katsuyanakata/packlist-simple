@@ -50,6 +50,38 @@ type Action =
 
 const STORAGE_KEY = 'packlist:v1'
 const DEFAULT_LIST_TITLE = '持ち物チェックリスト'
+const ICON_OPTIONS = [
+  '📦',
+  '👕',
+  '🧦',
+  '🪥',
+  '🧴',
+  '📱',
+  '🔌',
+  '🔋',
+  '💳',
+  '👛',
+  '🪪',
+  '💊',
+  '😷',
+  '🧻',
+  '🧼',
+  '🧢',
+  '🧥',
+  '👟',
+  '🕶️',
+  '🌂',
+  '🎫',
+  '🗂️',
+  '✏️',
+  '💻',
+  '🛍️',
+  '🩹',
+  '🍪',
+  '🥤',
+  '🍱',
+  '🧸'
+]
 
 type Screen = 'template' | 'checklist'
 
@@ -455,6 +487,7 @@ function App() {
   const [screen, setScreen] = useState<Screen>(initialData.screen)
 
   const [isEditOpen, setIsEditOpen] = useState(false)
+  const [isIconPickerOpen, setIsIconPickerOpen] = useState(false)
   const [newLabel, setNewLabel] = useState('')
   const [newIcon, setNewIcon] = useState('')
   const [error, setError] = useState('')
@@ -486,6 +519,7 @@ function App() {
   const todoItems = sortedItems.filter((item) => !item.done)
   const doneItems = sortedItems.filter((item) => item.done)
   const allDone = state.items.length > 0 && state.items.every((item) => item.done)
+  const selectedIcon = newIcon.trim() || '📦'
 
   const prevAllDone = useRef(allDone)
 
@@ -513,10 +547,16 @@ function App() {
 
   const showToast = (message: string) => setToast(message)
 
+  const closeEditor = () => {
+    setIsEditOpen(false)
+    setIsIconPickerOpen(false)
+  }
+
   const openEditor = () => {
     setNewIcon('')
     setNewLabel('')
     setError('')
+    setIsIconPickerOpen(false)
     setIsEditOpen(true)
   }
 
@@ -532,13 +572,14 @@ function App() {
       type: 'ADD_ITEM',
       payload: {
         label,
-        icon: newIcon.trim() || '📦'
+        icon: selectedIcon
       }
     })
 
     setNewLabel('')
     setNewIcon('')
     setError('')
+    setIsIconPickerOpen(false)
   }
 
   const resetDone = () => {
@@ -579,7 +620,7 @@ function App() {
     dispatch({ type: 'APPLY_TEMPLATE', template: selected })
     setScreen('checklist')
     setOpenedFromChecklist(false)
-    setIsEditOpen(false)
+    closeEditor()
   }
 
   const returnToChecklist = () => {
@@ -876,38 +917,76 @@ function App() {
       </footer>
 
       {isEditOpen && (
-        <div className="modal-overlay" role="presentation" onClick={() => setIsEditOpen(false)}>
+        <div className="modal-overlay" role="presentation" onClick={closeEditor}>
           <section className="modal" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
-            <h3>アイテムを追加</h3>
+            {isIconPickerOpen ? (
+              <div className="icon-picker-screen">
+                <div className="modal-top-row">
+                  <h3>アイコンを選択</h3>
+                  <button type="button" className="back-button" onClick={() => setIsIconPickerOpen(false)}>
+                    戻る
+                  </button>
+                </div>
 
-            <form className="add-form" onSubmit={addItem}>
-              <div className="add-row">
-                <label>
-                  アイコン
-                  <input
-                    placeholder="未入力で📦"
-                    maxLength={2}
-                    value={newIcon}
-                    onChange={(e) => setNewIcon(e.target.value)}
-                  />
-                </label>
-                <label>
-                  アイテム名
-                  <input
-                    placeholder="1〜20文字"
-                    maxLength={20}
-                    value={newLabel}
-                    onChange={(e) => setNewLabel(e.target.value)}
-                  />
-                </label>
+                <div id="icon-picker-grid" className="icon-picker picker-screen-grid" role="listbox" aria-label="アイコン候補">
+                  {ICON_OPTIONS.map((icon) => (
+                    <button
+                      key={icon}
+                      type="button"
+                      className={`icon-option${selectedIcon === icon ? ' selected' : ''}`}
+                      onClick={() => {
+                        setNewIcon(icon)
+                        setIsIconPickerOpen(false)
+                      }}
+                      aria-label={`アイコン ${icon}`}
+                    >
+                      {icon}
+                    </button>
+                  ))}
+                </div>
+
+                <button type="button" className="close-button" onClick={closeEditor}>
+                  閉じる
+                </button>
               </div>
-              <button type="submit">追加</button>
-              {error && <p className="error">{error}</p>}
-            </form>
+            ) : (
+              <>
+                <h3>アイテムを追加</h3>
 
-            <button type="button" className="close-button" onClick={() => setIsEditOpen(false)}>
-              閉じる
-            </button>
+                <form className="add-form" onSubmit={addItem}>
+                  <div className="add-row">
+                    <label className="icon-field">
+                      <button
+                        type="button"
+                        className="icon-picker-trigger"
+                        aria-label="アイコンを選択"
+                        aria-expanded={isIconPickerOpen}
+                        aria-controls="icon-picker-grid"
+                        aria-haspopup="listbox"
+                        onClick={() => setIsIconPickerOpen(true)}
+                      >
+                        <span className="icon-picker-current">{selectedIcon}</span>
+                      </button>
+                    </label>
+                    <label className="name-field">
+                      <input
+                        aria-label="アイテム名"
+                        placeholder="1〜20文字"
+                        maxLength={20}
+                        value={newLabel}
+                        onChange={(e) => setNewLabel(e.target.value)}
+                      />
+                    </label>
+                  </div>
+                  <button type="submit">追加</button>
+                  {error && <p className="error">{error}</p>}
+                </form>
+
+                <button type="button" className="close-button" onClick={closeEditor}>
+                  閉じる
+                </button>
+              </>
+            )}
           </section>
         </div>
       )}
