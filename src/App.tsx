@@ -415,10 +415,13 @@ const loadItemNotesSafely = (): ItemNotesById => {
     const parsed = JSON.parse(raw) as unknown
     if (!parsed || typeof parsed !== 'object') return {}
 
-    const entries = Object.entries(parsed as Record<string, unknown>).filter(
-      ([id, value]) => typeof id === 'string' && typeof value === 'string'
-    )
-    return Object.fromEntries(entries)
+    const notes: ItemNotesById = {}
+    Object.entries(parsed as Record<string, unknown>).forEach(([id, value]) => {
+      if (typeof value === 'string') {
+        notes[id] = value
+      }
+    })
+    return notes
   } catch {
     return {}
   }
