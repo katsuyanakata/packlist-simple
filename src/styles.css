@@ -127,7 +127,7 @@ body {
 
 .list {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: min(1.8vw, 8px);
   list-style: none;
   margin: 0;
@@ -202,7 +202,7 @@ body {
 }
 
 .footer button,
-.modal button {
+.modal button:not(.icon-picker-trigger):not(.icon-option):not(.back-button) {
   border: 1px solid #d6d6d6;
   border-radius: 8px;
   background: #fff;
@@ -371,10 +371,10 @@ body {
   border-radius: 10px;
   padding: 8px;
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: 6px;
-  max-height: 176px;
-  overflow: auto;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  max-height: min(52vh, 360px);
+  overflow-y: auto;
   background: #fff;
 }
 
@@ -385,14 +385,16 @@ body {
 
 .picker-screen-grid {
   margin-top: 0;
-  max-height: min(52vh, 380px);
-  grid-template-columns: repeat(7, minmax(0, 1fr));
+  max-height: min(52vh, 360px);
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .icon-option {
-  min-height: 36px;
-  border-radius: 8px;
-  font-size: 21px;
+  height: 50px;
+  border: 1.5px solid #cfcfcf;
+  border-radius: 18px;
+  background: #f8f8f8;
+  font-size: 42px;
   line-height: 1;
   padding: 0;
   display: inline-flex;
@@ -465,10 +467,14 @@ body {
   }
 
   .icon-picker {
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 
   .picker-screen-grid {
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .icon-option {
+    font-size: 36px;
   }
 }

@@ -944,10 +944,6 @@ function App() {
                     </button>
                   ))}
                 </div>
-
-                <button type="button" className="close-button" onClick={closeEditor}>
-                  閉じる
-                </button>
               </div>
             ) : (
               <>
